@@ -51,6 +51,8 @@ TOK_PER_SHEET = 224          # 实测：一屏 4 拼 1 ≈ 224 token
 FEAT_W, FEAT_H = 64, 36      # 分析用缩略尺寸
 ANALYZE_FPS = 4              # 分析帧率（够抓 0.25 秒级变化）
 MIN_SHOT = 0.15              # 短于此的片段忽略
+DARK_LUMA = 12.0             # 平均亮度低于此视为黑场（跳过，不花 token）
+MIN_HIST_THRESHOLD = 0.12    # 直方图阈值的绝对下限，防止短片把阈值压到噪声级
 
 # ---------------------------------------------------------------- 基础工具
 
@@ -146,7 +148,7 @@ def build_plan(luma, hist, cuts, dur, args):
     dh[1:] = 0.5 * np.abs(np.diff(hist, axis=0)).sum(axis=1)
 
     # 1) 状态变化点：颜色直方图的峰（软过渡也能抓）
-    thr_h = max(args.hist_threshold, float(np.percentile(dh, 90)))
+    thr_h = max(args.hist_threshold, float(np.percentile(dh, 90)), MIN_HIST_THRESHOLD)
     changes, last = [], -9e9
     for k in range(1, n - 1):
         t = k / fps
@@ -157,6 +159,7 @@ def build_plan(luma, hist, cuts, dur, args):
     # 2) 候选：状态变化后 0.35 秒一帧；没有变化点的镜头按 45% 一帧
     bounds = [0.0] + [c for c in cuts if 0 < c < dur] + [dur]
     shots = [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
+    dark = luma.mean(axis=(1, 2))          # 每帧平均亮度，用来识别黑场
     cand, used = [], set()
     for c in changes:
         pick = round(min(dur - 0.1, c + 0.35), 2)
@@ -167,7 +170,7 @@ def build_plan(luma, hist, cuts, dur, args):
         if e - s < MIN_SHOT or any(s - 0.3 <= c <= e + 0.3 for c in changes):
             continue
         pick = round(s + (e - s) * 0.45, 2)
-        if pick in used:
+        if pick in used or dark[min(n - 1, int(pick * fps))] < DARK_LUMA:
             continue
         used.add(pick)
         cand.append((pick, float(dpx[min(n - 1, int(pick * fps))]), (s, e), False))
@@ -247,17 +250,45 @@ def build_plan(luma, hist, cuts, dur, args):
         chosen.sort()
         remain -= 1
 
-    # 7) 近邻合并（<0.6 秒视为同一状态）
+    # 7) 近邻合并（<0.6 秒视为同一状态）+ 丢掉黑场帧
     merged = []
     for t in sorted(chosen):
         if merged and t - merged[-1] < 0.6:
             continue
+        if dark[min(n - 1, int(t * fps))] < DARK_LUMA:
+            continue                      # 淡入淡出的黑场不值得花 token
         merged.append(round(t, 2))
+    if not merged:                        # 全片都很暗时兜底，别返回空
+        merged = [round(dur * 0.5, 2)]
+
+    # 8) 预算没用满时补足：短视频尤其常见（32 秒片只选出 11 帧，漏掉同场景的第二次出现）
+    #    只在「间隔还够大」时补，直到用满预算或间隔小于 1.5 秒
+    guard = 0
+    while len(merged) < min(budget, args.max) and guard < budget * 2:
+        guard += 1
+        gaps = [(x, y, y - x) for x, y in zip(merged, merged[1:])]
+        if not gaps:
+            break
+        x, y, span = max(gaps, key=lambda g: g[2])
+        if span <= 1.5:
+            break
+        mid = round(x + span * 0.5, 2)
+        if any(abs(mid - c) < 0.3 for c in merged):
+            break
+        if dark[min(n - 1, int(mid * fps))] < DARK_LUMA:
+            break
+        merged.append(mid)
+        merged.sort()
 
     rows = []
     for t in merged:
         seg = next((c[2] for c in cand if abs(c[0] - t) < 0.02), None)
-        src = "状态变化" if any(abs(t - (c + 0.35)) < 0.02 for c in changes) else "镜头"
+        if any(abs(t - (c + 0.35)) < 0.02 for c in changes):
+            src = "状态变化"
+        elif seg is None:
+            src = "补点"          # 覆盖/预算补出来的点，不是原候选
+        else:
+            src = "镜头"
         k = min(n - 1, int(t * fps))
         rows.append({"time": t, "seg": seg, "src": src,
                      "dpx": round(float(dpx[k]), 2), "dh": round(float(dh[k]), 3)})
@@ -286,6 +317,22 @@ def write_manifest(path, video, dur, kept, rows, stats):
             i, r["time"], seg_s, r["dpx"], r["dh"], r["src"]))
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+
+
+def is_dark_frame(video, t, thr=DARK_LUMA):
+    """精确取 t 时刻的一帧，判断平均亮度是否低于阈值（黑场）。
+
+    为什么要单独取帧：分析阶段按 4fps 抽样，末尾黑场常被上一帧覆盖，
+    只有按精确时间 seek 才能看到真正的黑场。
+    """
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error",
+                        "-ss", "%.3f" % t, "-i", video, "-frames:v", "1",
+                        "-vf", "scale=32:18", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                       capture_output=True)
+    if r.returncode != 0 or not r.stdout:
+        return False
+    import numpy as _np
+    return float(_np.frombuffer(r.stdout[:576], dtype=_np.uint8).mean()) < thr
 
 
 def render_sheets(video, times, outdir, thumb_w=470):
@@ -418,6 +465,17 @@ def main_run(argv):
     tok = sheets * TOK_PER_SHEET + 250
     say("保留 %d 帧 → %d 张 4拼1 ｜ 预计 ≈%d token" % (len(kept), sheets, tok))
     say("采样点：" + ", ".join("%.1f" % t for t in kept))
+
+    # 精确验亮度：去掉黑场帧（淡入淡出不值得花 token）
+    keep2 = [t0 for t0 in kept if not is_dark_frame(args.video, t0)]
+    if keep2 and len(keep2) < len(kept):
+        say("去掉 %d 个黑场帧：%s" % (
+            len(kept) - len(keep2),
+            ", ".join("%.1f" % x for x in kept if x not in keep2)))
+        rows = [r for r in rows if r["time"] in keep2]
+        kept = keep2
+        sheets = (len(kept) + 3) // 4
+        tok = sheets * TOK_PER_SHEET + 250
 
     write_manifest(os.path.join(args.out, "manifest.md"), args.video, dur, kept, rows, stats)
     with open(os.path.join(args.out, "plan.json"), "w", encoding="utf-8") as f:
