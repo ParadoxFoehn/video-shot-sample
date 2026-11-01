@@ -1,0 +1,8 @@
+﻿# 忽略
+__pycache__/
+*.pyc
+out/
+*.mp4
+*.mkv
+*.mov
+.DS_Store
